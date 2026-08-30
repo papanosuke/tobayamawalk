@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>二俣城 時空バグ探偵 - GPS ADV プロトタイプ</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.24.0/maplibre-gl.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/5.24.0/maplibre-gl.min.js"></script>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    font-family: "MS Gothic", "MS PGothic", monospace;
+    touch-action: manipulation;
+  }
+  #map {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 1;
+  }
+  #hud {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 3;
+    background: rgba(0, 10, 0, 0.75); color: #0f0;
+    padding: 10px 14px; font-size: 13px; line-height: 1.6;
+    border-top: 2px solid #0f0;
+  }
+  #hud .warn { color: #f80; }
+  #game {
+    display: none; /* ADVモード時のみ表示 */
+    position: fixed; top: 0; left: 0;
+    margin: 0 auto; image-rendering: pixelated;
+    background: #000; z-index: 4;
+    width: 100%; height: 100%;
+  }
+  #overlay {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    color: #0f0; background: rgba(0,0,0,0.9); text-align: center;
+    padding: 20px; box-sizing: border-box; font-size: 14px; line-height: 1.6;
+    z-index: 10;
+  }
+  #overlay button {
+    background: #003300; color: #0f0; border: 2px solid #0f0;
+    padding: 10px 20px; font-size: 14px; margin-top: 12px; cursor: pointer;
+  }
+  .hidden { display: none !important; }
+
+  /* 自分の位置マーカー(方向つき) */
+  .player-marker {
+    width: 22px; height: 22px;
+  }
+  .player-marker .dot {
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #2ad4ff; border: 2px solid #fff;
+    box-shadow: 0 0 8px #2ad4ff;
+    position: absolute; left: 3px; top: 3px;
+  }
+  .player-marker .cone {
+    width: 0; height: 0;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-bottom: 16px solid rgba(42, 212, 255, 0.55);
+    position: absolute; left: 4px; top: -12px;
+    transform-origin: 50% 28px;
+  }
+  .target-marker {
+    width: 26px; height: 26px;
+    background: #ff3b3b;
+    border: 2px solid #fff;
+    border-radius: 50% 50% 50% 0;
+    transform: rotate(-45deg);
+    box-shadow: 0 0 6px #ff3b3b;
+  }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <div>
+    <p>二俣城 時空バグ探偵<br>GPS ADV プロトタイプ（3D地図版）</p>
+    <p style="font-size:12px; color:#aaa;">
+      位置情報の利用を許可してください。<br>
+      HTTPS環境（またはlocalhost）で開く必要があります。<br>
+      地図タイルの読み込みにはネット接続が必要です。
+    </p>
+    <button id="startBtn">開始する</button>
+    <br>
+    <button id="calibBtn" style="margin-top:20px; border-color:#ff0; color:#ff0;">
+      キャリブレーションモード（現地座標を記録する）
+    </button>
+  </div>
+</div>
+
+<div id="map"></div>
+<div id="hud" class="hidden"></div>
+<canvas id="game" width="480" height="720"></canvas>
+
+<script>
+"use strict";
+
+/* =========================================================
+   1. ゾーン定義（仮の座標。現地でキャリブレーションして上書きする）
+   ========================================================= */
+// TODO: 実際に二俣城址へ行き、キャリブレーションモードで
+//       ここの lat/lng を実測値に置き換えること。
+//       下の値は「静岡県浜松市天竜区二俣町二俣」付近の仮の目安値であり、
+//       検証済みの正確な座標ではない。
+const ZONES = [
+  { id: "minami_kuruwa", name: "南郭・登城口", chapter: 1, lat: 34.8710, lng: 137.8020, radius: 20 },
+  { id: "ninomaru",      name: "二の丸",       chapter: 2, lat: 34.8716, lng: 137.8017, radius: 15 },
+  { id: "honmaru",       name: "本丸・天守台", chapter: 3, lat: 34.8721, lng: 137.8013, radius: 12 },
+  { id: "seiryuji",      name: "清瀧寺・信康廟所", chapter: 4, lat: 34.8698, lng: 137.7995, radius: 20 },
+];
+
+/* =========================================================
+   2. 距離・方角の計算（Haversine公式）
+   ========================================================= */
+function toRad(deg) { return deg * Math.PI / 180; }
+function toDeg(rad) { return rad * 180 / Math.PI; }
+
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function bearing(lat1, lon1, lat2, lon2) {
+  const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+  const x =
+    Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+    Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+  let brng = toDeg(Math.atan2(y, x));
+  return (brng + 360) % 360;
+}
+
+/* =========================================================
+   3. GPS監視 + トリガー判定（誤差対策つき）
+   ========================================================= */
+const GeoTracker = {
+  watchId: null,
+  current: null,
+  insideStreak: {},
+  CONFIRM_COUNT: 3,
+  ACCURACY_CAP: 30,
+
+  start(onUpdate) {
+    if (!navigator.geolocation) {
+      alert("この端末は位置情報に対応していません。");
+      return;
+    }
+    this.watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        this.current = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          heading: pos.coords.heading, // 移動中のみ値が入ることが多い
+        };
+        onUpdate(this.current, null);
+      },
+      (err) => onUpdate(null, err),
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+  },
+
+  stop() {
+    if (this.watchId !== null) navigator.geolocation.clearWatch(this.watchId);
+  },
+
+  checkZone(zone) {
+    if (!this.current) return { arrived: false, distance: null };
+    if (this.current.accuracy > this.ACCURACY_CAP) {
+      return { arrived: false, distance: null, waitingForAccuracy: true };
+    }
+    const dist = haversineDistance(this.current.lat, this.current.lng, zone.lat, zone.lng);
+    const effectiveDist = dist - this.current.accuracy;
+    const inRange = effectiveDist <= zone.radius;
+
+    if (inRange) {
+      this.insideStreak[zone.id] = (this.insideStreak[zone.id] || 0) + 1;
+    } else {
+      this.insideStreak[zone.id] = 0;
+    }
+    const arrived = this.insideStreak[zone.id] >= this.CONFIRM_COUNT;
+    return { arrived, distance: dist };
+  },
+};
+
+/* =========================================================
+   4. ゲーム状態
+   ========================================================= */
+const GameState = {
+  chapter: 0,
+  mode: "map", // "map" | "adv"
+  currentZone: null,
+};
+
+function nextZone() {
+  return ZONES.find((z) => z.chapter === GameState.chapter + 1);
+}
+
+/* =========================================================
+   5. 3D地図（MapLibre GL JS + OpenFreeMap "3d"スタイル）
+   ========================================================= */
+let map = null;
+let playerMarker = null;
+let targetMarker = null;
+
+let mapInitialized = false;
+let mapLoaded = false;
+let hasRealFix = false; // 実GPS位置を一度でも取得できたか
+
+// 現在地が分かるまでの仮の中心地点(ZONESの最初の地点＝二俣城址付近)
+const FALLBACK_CENTER = { lat: ZONES[0].lat, lng: ZONES[0].lng };
+
+function initMap(initialLat, initialLng) {
+  if (mapInitialized) return;
+  mapInitialized = true;
+
+  if (typeof maplibregl === "undefined") {
+    document.getElementById("hud").classList.remove("hidden");
+    document.getElementById("hud").innerHTML =
+      '<span class="warn">地図ライブラリの読み込みに失敗しました。ネット接続を確認してください。</span>';
+    return;
+  }
+
+  map = new maplibregl.Map({
+    container: "map",
+    style: "https://tiles.openfreemap.org/styles/3d", // 無料・APIキー不要、建物が立体表示される
+    center: [initialLng, initialLat],
+    zoom: 18.5,
+    pitch: 60,   // 傾けて「ポケモンGo」風の見え方にする
+    bearing: 0,
+    attributionControl: true,
+  });
+
+  map.on("load", () => { mapLoaded = true; });
+
+  map.on("error", (e) => {
+    console.error("MapLibre error:", e && e.error);
+    const hud = document.getElementById("hud");
+    hud.classList.remove("hidden");
+    hud.innerHTML = '<span class="warn">地図タイルの読み込みでエラーが発生しました（コンソールを確認してください）</span>';
+  });
+
+  // 自分の位置マーカー(方向つき三角コーン)
+  const el = document.createElement("div");
+  el.className = "player-marker";
+  el.innerHTML = '<div class="cone" id="playerCone"></div><div class="dot"></div>';
+  playerMarker = new maplibregl.Marker({ element: el }).setLngLat([initialLng, initialLat]).addTo(map);
+}
+
+function updateTargetMarker(zone) {
+  if (!map) return;
+  if (targetMarker) targetMarker.remove();
+  if (!zone) return;
+  const el = document.createElement("div");
+  el.className = "target-marker";
+  targetMarker = new maplibregl.Marker({ element: el }).setLngLat([zone.lng, zone.lat]).addTo(map);
+}
+
+function updatePlayerOnMap(current) {
+  if (!map || !playerMarker) return;
+  playerMarker.setLngLat([current.lng, current.lat]);
+  // 進行方向が取得できていれば矢印コーンを回転させる
+  if (current.heading !== null && current.heading !== undefined && !isNaN(current.heading)) {
+    const cone = document.getElementById("playerCone");
+    if (cone) cone.style.transform = `rotate(${current.heading}deg)`;
+  }
+  // プレイヤーを画面中央に追従させる(ポケモンGoのオートフォロー風)
+  map.easeTo({ center: [current.lng, current.lat], duration: 400 });
+}
+
+/* =========================================================
+   6. HUD表示
+   ========================================================= */
+function updateHud(target, check) {
+  const hud = document.getElementById("hud");
+  hud.classList.remove("hidden");
+  if (!target) {
+    hud.innerHTML = "全ての章をクリアしました。";
+    return;
+  }
+  let html = `目的地: ${target.name}<br>`;
+  if (GeoTracker.current) {
+    html += `距離: 約${Math.round(check.distance)}m ／ GPS精度: ±${Math.round(GeoTracker.current.accuracy)}m`;
+    if (check.waitingForAccuracy) {
+      html += `<br><span class="warn">GPS精度待ち... 空の見える場所へ移動してください</span>`;
+    }
+  } else {
+    html += "GPS取得中...";
+  }
+  hud.innerHTML = html;
+}
+
+/* =========================================================
+   7. ADV画面（コマンド式・キャンバス描画）
+   ========================================================= */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+const CHAPTER_TEXT = {
+  1: {
+    title: "第1章 - 南郭・登城口",
+    body: [
+      "案内板の文字が、なぜか一部だけ滲んで読めない。",
+      "「この場所で、天正七年（1579年）、家康の嫡男・",
+      "信康は◯◯◯の命によりこの城に幽閉された」",
+      "",
+      "> しらべる：案内板をよく見る",
+      "> もどる：地図画面へ",
+    ],
+  },
+  2: {
+    title: "第2章 - 二の丸",
+    body: [
+      "二人の家臣が残した記録に食い違いがある。",
+      "一方は「信康様は静かに受け入れられた」と記し、",
+      "もう一方は「最後まで抗弁された」と記している。",
+      "",
+      "> しらべる：記録を比較する",
+      "> もどる：地図画面へ",
+    ],
+  },
+  3: {
+    title: "第3章 - 本丸・天守台",
+    body: [
+      "石垣の虎口をくぐった瞬間、視界が歪む。",
+      "1579年、当日の光景が重なって見える——。",
+      "これまでの手がかりから、真相を推理せよ。",
+      "",
+      "> すいりする：3つの説から選ぶ",
+      "> もどる：地図画面へ",
+    ],
+  },
+  4: {
+    title: "第4章 - 清瀧寺・信康廟所",
+    body: [
+      "廟所の前で、選んだ結論を胸に手を合わせる。",
+      "歴史の解釈は一つではない。",
+      "それでも、この場所にあった悲劇は確かに存在した。",
+      "",
+      "> てをあわせる：エンディングへ",
+    ],
+  },
+};
+
+function drawAdvScreen() {
+  ctx.fillStyle = "#000010";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const data = CHAPTER_TEXT[GameState.chapter];
+  ctx.fillStyle = "#fff";
+  ctx.font = "16px monospace";
+  ctx.fillText(data.title, 20, 40);
+
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(15, 60, canvas.width - 30, 260);
+
+  ctx.font = "14px monospace";
+  data.body.forEach((line, i) => ctx.fillText(line, 25, 90 + i * 22));
+
+  ctx.fillStyle = "#888";
+  ctx.font = "12px monospace";
+  ctx.fillText("(画面をタップで地図画面へ戻る - プロトタイプ簡易操作)", 20, 400);
+}
+
+function enterAdvScene(zone) {
+  GameState.mode = "adv";
+  GameState.chapter = zone.chapter;
+  GameState.currentZone = zone;
+  document.getElementById("map").classList.add("hidden");
+  document.getElementById("hud").classList.add("hidden");
+  canvas.style.display = "block";
+  drawAdvScreen();
+}
+
+function enterMapMode() {
+  GameState.mode = "map";
+  GameState.currentZone = nextZone();
+  GeoTracker.insideStreak = {};
+  canvas.style.display = "none";
+  document.getElementById("map").classList.remove("hidden");
+  document.getElementById("hud").classList.remove("hidden");
+  updateTargetMarker(GameState.currentZone);
+  if (map) map.resize();
+}
+
+canvas.addEventListener("click", () => {
+  if (GameState.mode === "adv") enterMapMode();
+});
+
+/* =========================================================
+   8. GPS更新のたびに呼ばれるメインハンドラ
+   ========================================================= */
+function onGeoUpdate(current, err) {
+  if (err) {
+    console.warn("GPSエラー:", err.message);
+    const hud = document.getElementById("hud");
+    hud.classList.remove("hidden");
+    hud.innerHTML =
+      `<span class="warn">GPS取得エラー: ${err.message}` +
+      `（code:${err.code}）。地図は仮の中心地点で表示中です。` +
+      `HTTPS環境で開き、位置情報の許可を確認してください。</span>`;
+    return;
+  }
+
+  if (!hasRealFix) {
+    hasRealFix = true;
+    if (map) {
+      // 仮の中心から実際のGPS位置へカメラを移動
+      map.flyTo({ center: [current.lng, current.lat], zoom: 18.5, duration: 1000 });
+    }
+  }
+
+  if (GameState.mode !== "map") return;
+
+  updatePlayerOnMap(current);
+
+  const target = GameState.currentZone;
+  if (!target) {
+    updateHud(null, null);
+    return;
+  }
+  const check = GeoTracker.checkZone(target);
+  updateHud(target, check);
+  if (check.arrived) enterAdvScene(target);
+}
+
+/* =========================================================
+   9. キャリブレーションモード（現地で実座標を記録する）
+   ========================================================= */
+function startCalibrationMode() {
+  document.getElementById("overlay").classList.add("hidden");
+  document.getElementById("map").classList.add("hidden");
+  canvas.style.display = "block";
+  ctx.fillStyle = "#001a00";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#ff0";
+  ctx.font = "14px monospace";
+  ctx.fillText("キャリブレーションモード", 20, 30);
+  ctx.fillText("現在地の座標を表示します", 20, 55);
+
+  navigator.geolocation.watchPosition(
+    (pos) => {
+      ctx.fillStyle = "#001a00";
+      ctx.fillRect(0, 60, canvas.width, 200);
+      ctx.fillStyle = "#0f0";
+      ctx.font = "13px monospace";
+      ctx.fillText(`lat: ${pos.coords.latitude.toFixed(6)}`, 20, 100);
+      ctx.fillText(`lng: ${pos.coords.longitude.toFixed(6)}`, 20, 125);
+      ctx.fillText(`精度: ±${Math.round(pos.coords.accuracy)}m`, 20, 150);
+      ctx.fillText("この値をコピーしてZONESに貼り付けてください", 20, 190);
+    },
+    (err) => {
+      ctx.fillStyle = "#f00";
+      ctx.fillText("エラー: " + err.message, 20, 100);
+    },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
+  );
+}
+
+/* =========================================================
+   10. 起動処理
+   ========================================================= */
+document.getElementById("startBtn").addEventListener("click", () => {
+  document.getElementById("overlay").classList.add("hidden");
+  document.getElementById("hud").classList.remove("hidden");
+  document.getElementById("hud").innerHTML = "地図を読み込み中...";
+
+  // GPSの成否に関わらず、まず仮の中心地点(二俣城址)で地図を表示する
+  initMap(FALLBACK_CENTER.lat, FALLBACK_CENTER.lng);
+  GameState.currentZone = nextZone();
+  updateTargetMarker(GameState.currentZone);
+
+  GeoTracker.start(onGeoUpdate);
+});
+
+document.getElementById("calibBtn").addEventListener("click", startCalibrationMode);
+
+</script>
+</body>
+</html>
