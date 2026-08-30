@@ -177,7 +177,11 @@ const GeoTracker = {
   current: null,
   insideStreak: {},
   CONFIRM_COUNT: 3,
-  ACCURACY_CAP: 30,
+  // ノートPCのWi-Fiベース位置情報は80~150m程度の精度になるのが普通なので、
+  // 30mでは厳しすぎて「距離0mなのに進めない」状態になっていた。
+  // 150mまで許容しつつ、下のeffectiveDist計算(距離-精度)で
+  // 数百m~数km単位の誤差(IPアドレス由来など)による誤トリガーは引き続き防ぐ。
+  ACCURACY_CAP: 150,
 
   start(onUpdate) {
     if (!navigator.geolocation) {
