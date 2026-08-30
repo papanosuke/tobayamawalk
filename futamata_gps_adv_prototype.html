@@ -70,9 +70,19 @@
     transform: rotate(-45deg);
     box-shadow: 0 0 6px #ff3b3b;
   }
+  #debugLog {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 20;
+    background: rgba(0,0,0,0.85); color: #0f0;
+    font-size: 11px; line-height: 1.5; font-family: monospace;
+    max-height: 40vh; overflow-y: auto; padding: 6px 8px;
+    white-space: pre-wrap; word-break: break-all;
+    border-bottom: 1px solid #0f0;
+  }
 </style>
 </head>
 <body>
+
+<div id="debugLog">デバッグログ起動待ち...</div>
 
 <div id="overlay">
   <div>
@@ -96,6 +106,28 @@
 
 <script>
 "use strict";
+
+/* =========================================================
+   0. 画面上に直接表示するデバッグログ
+   （DevToolsを開かなくても、どこで止まっているか分かるようにする）
+   ========================================================= */
+const debugLines = [];
+function logDebug(msg) {
+  const time = new Date().toLocaleTimeString();
+  debugLines.push(`[${time}] ${msg}`);
+  if (debugLines.length > 30) debugLines.shift();
+  const el = document.getElementById("debugLog");
+  if (el) el.textContent = debugLines.join("\n");
+  console.log(msg);
+}
+window.addEventListener("error", (e) => {
+  logDebug(`★JSエラー: ${e.message} (${e.filename}:${e.lineno})`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  logDebug(`★Promiseエラー: ${e.reason}`);
+});
+
+logDebug(`スクリプト開始。maplibregl読み込み状況: ${typeof maplibregl}`);
 
 /* =========================================================
    1. ゾーン定義（仮の座標。現地でキャリブレーションして上書きする）
@@ -221,37 +253,89 @@ function initMap(initialLat, initialLng) {
   if (mapInitialized) return;
   mapInitialized = true;
 
+  logDebug(`initMap呼び出し (lat:${initialLat}, lng:${initialLng})`);
+
   if (typeof maplibregl === "undefined") {
+    logDebug("★maplibreglが未定義。ライブラリ本体(JS)の読み込みに失敗しています。");
     document.getElementById("hud").classList.remove("hidden");
     document.getElementById("hud").innerHTML =
       '<span class="warn">地図ライブラリの読み込みに失敗しました。ネット接続を確認してください。</span>';
     return;
   }
 
-  map = new maplibregl.Map({
-    container: "map",
-    style: "https://tiles.openfreemap.org/styles/3d", // 無料・APIキー不要、建物が立体表示される
-    center: [initialLng, initialLat],
-    zoom: 18.5,
-    pitch: 60,   // 傾けて「ポケモンGo」風の見え方にする
-    bearing: 0,
-    attributionControl: true,
-  });
+  try {
+    map = new maplibregl.Map({
+      container: "map",
+      // 注: OpenFreeMapに"3d"というスタイルは存在しない(404の原因だった)。
+      // 実在する"liberty"スタイルを土台にし、buildingレイヤーを下でfill-extrusionとして自前追加する。
+      style: "https://tiles.openfreemap.org/styles/liberty",
+      center: [initialLng, initialLat],
+      zoom: 18.5,
+      pitch: 60,   // 傾けて「ポケモンGo」風の見え方にする
+      bearing: 0,
+    });
+    logDebug("maplibregl.Map生成に成功。スタイル読み込み待ち...");
+  } catch (ex) {
+    logDebug(`★maplibregl.Map生成で例外発生: ${ex.message}`);
+    return;
+  }
 
-  map.on("load", () => { mapLoaded = true; });
+  map.on("load", () => {
+    mapLoaded = true;
+    logDebug("地図スタイルの読み込み完了 (loadイベント発火)");
+    try {
+      addBuildingExtrusion();
+    } catch (ex) {
+      logDebug(`★3D建物レイヤー追加で例外: ${ex.message}`);
+    }
+  });
 
   map.on("error", (e) => {
-    console.error("MapLibre error:", e && e.error);
-    const hud = document.getElementById("hud");
-    hud.classList.remove("hidden");
-    hud.innerHTML = '<span class="warn">地図タイルの読み込みでエラーが発生しました（コンソールを確認してください）</span>';
+    const detail = (e && e.error && e.error.message) ? e.error.message : JSON.stringify(e && e.error);
+    logDebug(`★MapLibreエラー: ${detail}`);
   });
+
+  map.on("styledata", () => logDebug("styledataイベント発火"));
+  map.on("sourcedataloading", () => {}); // 頻発するのでログ省略
 
   // 自分の位置マーカー(方向つき三角コーン)
   const el = document.createElement("div");
   el.className = "player-marker";
   el.innerHTML = '<div class="cone" id="playerCone"></div><div class="dot"></div>';
   playerMarker = new maplibregl.Marker({ element: el }).setLngLat([initialLng, initialLat]).addTo(map);
+  logDebug("プレイヤーマーカー設置完了");
+}
+
+// OpenFreeMap(liberty)はOpenMapTilesスキーマなので、
+// source="openmaptiles", source-layer="building" に
+// render_height / render_min_height (メートル単位)が入っている。
+// これをfill-extrusionレイヤーとして追加し、建物を立体化する。
+function addBuildingExtrusion() {
+  const layers = map.getStyle().layers;
+  let labelLayerId;
+  for (const layer of layers) {
+    if (layer.type === "symbol" && layer.layout && layer.layout["text-field"]) {
+      labelLayerId = layer.id;
+      break;
+    }
+  }
+  map.addLayer(
+    {
+      id: "3d-buildings",
+      source: "openmaptiles",
+      "source-layer": "building",
+      type: "fill-extrusion",
+      minzoom: 14,
+      paint: {
+        "fill-extrusion-color": "#b0a99a",
+        "fill-extrusion-height": ["coalesce", ["get", "render_height"], 6],
+        "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], 0],
+        "fill-extrusion-opacity": 0.85,
+      },
+    },
+    labelLayerId
+  );
+  logDebug("3D建物レイヤーを追加しました");
 }
 
 function updateTargetMarker(zone) {
@@ -397,7 +481,12 @@ canvas.addEventListener("click", () => {
 /* =========================================================
    8. GPS更新のたびに呼ばれるメインハンドラ
    ========================================================= */
+let firstGeoLogDone = false;
 function onGeoUpdate(current, err) {
+  if (!firstGeoLogDone) {
+    firstGeoLogDone = true;
+    logDebug(err ? `初回GPSコールバック: エラー (${err.message})` : `初回GPSコールバック: 成功 (accuracy:${current.accuracy}m)`);
+  }
   if (err) {
     console.warn("GPSエラー:", err.message);
     const hud = document.getElementById("hud");
@@ -468,6 +557,7 @@ function startCalibrationMode() {
    10. 起動処理
    ========================================================= */
 document.getElementById("startBtn").addEventListener("click", () => {
+  logDebug("開始ボタン押下");
   document.getElementById("overlay").classList.add("hidden");
   document.getElementById("hud").classList.remove("hidden");
   document.getElementById("hud").innerHTML = "地図を読み込み中...";
