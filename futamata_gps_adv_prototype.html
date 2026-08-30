@@ -468,6 +468,7 @@ function enterAdvScene(zone) {
 }
 
 function enterMapMode() {
+  logDebug(`地図モードへ戻る。次の目的地: ${nextZone() ? nextZone().name : "(なし・全章クリア)"}`);
   GameState.mode = "map";
   GameState.currentZone = nextZone();
   GeoTracker.insideStreak = {};
@@ -521,7 +522,22 @@ function onGeoUpdate(current, err) {
   }
   const check = GeoTracker.checkZone(target);
   updateHud(target, check);
-  if (check.arrived) enterAdvScene(target);
+
+  // 4秒おきに進捗をデバッグログへ出す(章到達判定が見えるように)
+  const now = Date.now();
+  if (!onGeoUpdate._lastLog || now - onGeoUpdate._lastLog > 4000) {
+    onGeoUpdate._lastLog = now;
+    const streak = GeoTracker.insideStreak[target.id] || 0;
+    logDebug(
+      `[進捗] 目的地:${target.name} 距離:${check.distance !== null ? Math.round(check.distance) : "?"}m ` +
+      `精度:${Math.round(current.accuracy)}m 連続判定:${streak}/${GeoTracker.CONFIRM_COUNT}`
+    );
+  }
+
+  if (check.arrived) {
+    logDebug(`★到達判定！ 第${target.chapter}章「${target.name}」へ切り替えます`);
+    enterAdvScene(target);
+  }
 }
 
 /* =========================================================
