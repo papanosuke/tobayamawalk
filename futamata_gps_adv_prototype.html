@@ -277,6 +277,7 @@ function initMap(initialLat, initialLng) {
       zoom: 18.5,
       pitch: 60,   // 傾けて「ポケモンGo」風の見え方にする
       bearing: 0,
+      preserveDrawingBuffer: true, // エンカウント演出でmap.getCanvas()をスナップショットするために必要
     });
     logDebug("maplibregl.Map生成に成功。スタイル読み込み待ち...");
   } catch (ex) {
@@ -457,6 +458,100 @@ function drawAdvScreen() {
   ctx.fillText("(画面をタップで地図画面へ戻る - プロトタイプ簡易操作)", 20, 400);
 }
 
+/* =========================================================
+   7.5 「エンカウント」演出（ドラクエ風：フラッシュ→ブロック暗転）
+   ========================================================= */
+function playEncounterSound() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const actx = new AudioCtx();
+    const now = actx.currentTime;
+    for (let i = 0; i < 2; i++) {
+      const osc = actx.createOscillator();
+      const gain = actx.createGain();
+      osc.type = "square";
+      osc.frequency.setValueAtTime(220, now + i * 0.3);
+      osc.frequency.linearRampToValueAtTime(880, now + i * 0.3 + 0.15);
+      gain.gain.setValueAtTime(0.15, now + i * 0.3);
+      gain.gain.linearRampToValueAtTime(0.0001, now + i * 0.3 + 0.25);
+      osc.connect(gain).connect(actx.destination);
+      osc.start(now + i * 0.3);
+      osc.stop(now + i * 0.3 + 0.3);
+    }
+  } catch (ex) {
+    logDebug(`音声再生エラー: ${ex.message}`);
+  }
+}
+
+function triggerEncounter(zone) {
+  if (GameState.mode !== "map") return; // 多重発火防止
+  logDebug(`エンカウント演出開始: ${zone.name}`);
+  GameState.mode = "transitioning"; // これ以降、次のGPS更新でのゾーン判定をブロックする
+
+  document.getElementById("map").classList.add("hidden");
+  document.getElementById("hud").classList.add("hidden");
+  canvas.style.display = "block";
+
+  // 直前の地図の見た目をキャンバスへ焼き付ける(フィールド画面のスナップショット)
+  let snapshot = null;
+  try {
+    ctx.drawImage(map.getCanvas(), 0, 0, canvas.width, canvas.height);
+    snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  } catch (ex) {
+    logDebug(`スナップショット取得エラー: ${ex.message}`);
+    ctx.fillStyle = "#001a00";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  }
+
+  playEncounterSound();
+
+  // --- フェーズ1: 白フラッシュを数回 ---
+  let flashCount = 0;
+  const FLASH_TOTAL = 4;
+  const flashTimer = setInterval(() => {
+    ctx.putImageData(snapshot, 0, 0);
+    if (flashCount % 2 === 0) {
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    flashCount++;
+    if (flashCount >= FLASH_TOTAL) {
+      clearInterval(flashTimer);
+      runBlockWipe();
+    }
+  }, 70);
+
+  // --- フェーズ2: ランダムなブロック単位で黒く塗りつぶしていく ---
+  function runBlockWipe() {
+    ctx.putImageData(snapshot, 0, 0);
+    const cols = 12, rows = 16;
+    const blockW = canvas.width / cols;
+    const blockH = canvas.height / rows;
+    const blocks = [];
+    for (let x = 0; x < cols; x++) {
+      for (let y = 0; y < rows; y++) blocks.push({ x, y });
+    }
+    for (let i = blocks.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [blocks[i], blocks[j]] = [blocks[j], blocks[i]];
+    }
+    let idx = 0;
+    const perTick = Math.max(1, Math.ceil(blocks.length / 20));
+    ctx.fillStyle = "#000";
+    const wipeTimer = setInterval(() => {
+      for (let k = 0; k < perTick && idx < blocks.length; k++, idx++) {
+        const b = blocks[idx];
+        ctx.fillRect(Math.floor(b.x * blockW), Math.floor(b.y * blockH), Math.ceil(blockW) + 1, Math.ceil(blockH) + 1);
+      }
+      if (idx >= blocks.length) {
+        clearInterval(wipeTimer);
+        setTimeout(() => enterAdvScene(zone), 150);
+      }
+    }, 35);
+  }
+}
+
 function enterAdvScene(zone) {
   GameState.mode = "adv";
   GameState.chapter = zone.chapter;
@@ -536,7 +631,7 @@ function onGeoUpdate(current, err) {
 
   if (check.arrived) {
     logDebug(`★到達判定！ 第${target.chapter}章「${target.name}」へ切り替えます`);
-    enterAdvScene(target);
+    triggerEncounter(target);
   }
 }
 
