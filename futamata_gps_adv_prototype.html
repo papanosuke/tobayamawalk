@@ -233,12 +233,20 @@ const GeoTracker = {
    ========================================================= */
 const GameState = {
   chapter: 0,
-  mode: "map", // "map" | "adv"
+  mode: "map", // "map" | "adv" | "transitioning"
   currentZone: null,
+  inventory: [],          // 手に入れたアイテムID一覧
+  flags: {},              // 章内の細かいフラグ(証言を読んだか、など)
+  chapterCleared: { 1: false, 2: false, 3: false, 4: false }, // 章の「解決」フラグ
+  endingChoice: null,     // 第3章で選んだ説のid
 };
 
+// 章クリア(=次のゾーンが解放される)条件は「GPSで着いたか」ではなく
+// 「その章の謎を解いたか」にする。AをクリアしたらBが解放される、という
+// フラグ管理の核はここ。
 function nextZone() {
-  return ZONES.find((z) => z.chapter === GameState.chapter + 1);
+  const nextChapterNum = ZONES.map((z) => z.chapter).find((chNum) => !GameState.chapterCleared[chNum]);
+  return ZONES.find((z) => z.chapter === nextChapterNum);
 }
 
 /* =========================================================
@@ -423,70 +431,538 @@ function updateHud(target, check) {
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 
-const CHAPTER_TEXT = {
+/* ---- アイテム管理 ---- */
+const ITEM_LABELS = {};
+function hasItem(id) {
+  return GameState.inventory.includes(id);
+}
+function addItem(id, label) {
+  if (!hasItem(id)) {
+    GameState.inventory.push(id);
+    ITEM_LABELS[id] = label;
+    logDebug(`アイテム入手: ${label}`);
+  }
+}
+
+/* ---- キャンバス上のクリック判定(ヒットボックス)管理 ---- */
+let activeHitboxes = [];
+function addHitbox(x, y, w, h, onClick) {
+  activeHitboxes.push({ x, y, w, h, onClick });
+}
+function getCanvasPos(evt) {
+  const rect = canvas.getBoundingClientRect();
+  const src = evt.touches && evt.touches.length ? evt.touches[0] : evt;
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return {
+    x: (src.clientX - rect.left) * scaleX,
+    y: (src.clientY - rect.top) * scaleY,
+  };
+}
+function drawButton(x, y, w, h, label, onClick, opts) {
+  opts = opts || {};
+  const disabled = !!opts.disabled;
+  ctx.strokeStyle = disabled ? "#555" : "#fff";
+  ctx.fillStyle = disabled ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.08)";
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = disabled ? "#666" : "#fff";
+  ctx.font = "14px monospace";
+  ctx.fillText(label, x + 10, y + h / 2 + 5);
+  if (!disabled) addHitbox(x, y, w, h, onClick);
+}
+
+/* ---- ADV画面内のサブ状態 ---- */
+let advView = { screen: "main" };
+
+/* 章クリア判定を毎回更新する。「AをクリアしたらBが解放される」の核。 */
+function updateChapterClearStatus() {
+  GameState.chapterCleared[1] = hasItem("diary1");
+  GameState.chapterCleared[2] = hasItem("memo2");
+  GameState.chapterCleared[3] = !!GameState.endingChoice;
+  GameState.chapterCleared[4] = !!GameState.flags.paidRespects;
+}
+
+/* ---- 各章のデータ本体 ---- */
+const CHAPTERS = {
   1: {
     title: "第1章 - 南郭・登城口",
-    body: [
+    intro: [
       "案内板の文字が、なぜか一部だけ滲んで読めない。",
       "「この場所で、天正七年（1579年）、家康の嫡男・",
       "信康は◯◯◯の命によりこの城に幽閉された」",
-      "",
-      "> しらべる：案内板をよく見る",
-      "> もどる：地図画面へ",
+    ],
+    examine: [
+      {
+        id: "signboard",
+        label: "案内板をよく見る",
+        type: "quiz",
+        prompt: "滲んだ文字の下に、うっすらと別の名が見える。誰の命か？",
+        choices: ["織田信長", "武田勝頼", "今川氏真"],
+        correct: 0,
+        itemId: "diary1",
+        itemLabel: "焼けた日記の断片・一",
+        successText: [
+          "文字が焼け跡のように黒ずんで浮かび上がる。",
+          "「織田信長」――そう読み取れた気がする。",
+          "手のひらに、焼けた日記の断片が残された。",
+        ],
+        failText: [
+          "文字はさらに滲み、読み取れなかった。",
+          "もう一度、目を凝らしてみよう。",
+        ],
+      },
+      {
+        id: "kurayashiki",
+        label: "蔵屋敷跡を歩く",
+        type: "flavor",
+        text: [
+          "礎石だけが残る蔵屋敷跡。",
+          "当時ここに兵糧や武具が納められていたという。",
+          "今はただ、風が抜けていくだけだ。",
+        ],
+      },
+      {
+        id: "ishigaki",
+        label: "野面積みの石垣に触れる",
+        type: "flavor_item",
+        itemId: "kokuin",
+        itemLabel: "刻印の写し",
+        text: [
+          "石の一つに、小さな刻印が彫られているのに気づいた。",
+          "石工の名か、それとも別の意味があるのか。",
+          "写し取っておくことにした。",
+        ],
+        repeatText: ["刻印の写しは、もう手元にある。"],
+      },
     ],
   },
   2: {
     title: "第2章 - 二の丸",
-    body: [
+    intro: [
       "二人の家臣が残した記録に食い違いがある。",
       "一方は「信康様は静かに受け入れられた」と記し、",
       "もう一方は「最後まで抗弁された」と記している。",
-      "",
-      "> しらべる：記録を比較する",
-      "> もどる：地図画面へ",
+    ],
+    examine: [
+      {
+        id: "recordA",
+        label: "記録Ａ（某家臣の覚書）を読む",
+        type: "flavor_flag",
+        flagId: "readA",
+        text: [
+          "「信康様は御沙汰を静かにお受けになった。",
+          "　最後まで取り乱すこと、なし」",
+        ],
+      },
+      {
+        id: "recordB",
+        label: "記録Ｂ（別の家臣の覚書）を読む",
+        type: "flavor_flag",
+        flagId: "readB",
+        text: [
+          "「信康様は使者に対し、身に覚えなしと",
+          "　繰り返し抗弁されたと聞く」",
+        ],
+      },
+      {
+        id: "compare",
+        label: "二つの記録を比較する",
+        type: "quiz",
+        requires: ["readA", "readB"],
+        lockedText: ["両方の記録に、まず目を通す必要がありそうだ。"],
+        prompt: "二つの記録、何が根本的に食い違っているのか？",
+        choices: [
+          "切腹を命じた使者の名前そのもの",
+          "信康が着ていた衣装の色",
+          "処断が行われた時刻",
+        ],
+        correct: 0,
+        itemId: "memo2",
+        itemLabel: "疑惑のメモ",
+        successText: [
+          "命を伝えたとされる使者の名が、記録によって違う。",
+          "――そもそも、本当に一つの「命令」だったのか？",
+          "疑惑をまとめたメモが手元に残った。",
+        ],
+        failText: ["読み違えたようだ。もう一度、内容を確かめてみよう。"],
+      },
+      {
+        id: "dorui",
+        label: "土塁の上に立つ",
+        type: "flavor",
+        text: [
+          "土塁の上からは、天竜川の流れがよく見える。",
+          "440年以上前も、同じ川音が聞こえていたのだろうか。",
+        ],
+      },
     ],
   },
   3: {
     title: "第3章 - 本丸・天守台",
-    body: [
+    intro: [
       "石垣の虎口をくぐった瞬間、視界が歪む。",
-      "1579年、当日の光景が重なって見える——。",
+      "1579年、当日の光景が重なって見える――。",
       "これまでの手がかりから、真相を推理せよ。",
-      "",
-      "> すいりする：3つの説から選ぶ",
-      "> もどる：地図画面へ",
+    ],
+    examine: [
+      {
+        id: "ishigaki3",
+        label: "天守台の石垣を見る",
+        type: "flavor",
+        text: ["野面積みの石垣が、時空を超えて今も残っている。"],
+      },
+      {
+        id: "koguchi",
+        label: "虎口の跡を調べる",
+        type: "flavor",
+        text: ["敵の侵入を防ぐための折れ曲がった通路の跡。"],
+      },
+    ],
+    deductionRequires: ["diary1", "kokuin", "memo2"],
+    deductionLockedText: [
+      "まだ手がかりが足りない。",
+      "焼けた日記の断片・刻印の写し・疑惑のメモ、",
+      "この3つが揃うまでは推理できそうにない。",
+    ],
+    deductionChoices: [
+      {
+        id: "nobunaga",
+        label: "織田信長による処断命令説",
+        text: [
+          "信長が武田内通の疑いを理由に切腹を厳命した――",
+          "もっとも広く伝わる説だ。",
+          "だが一次史料での裏付けは実は薄いとも言われる。",
+        ],
+      },
+      {
+        id: "ieyasu",
+        label: "家康自身の判断だった説",
+        text: [
+          "信長への配慮ではなく、家康自身が",
+          "家中統制のために下した決断だったという説。",
+          "近年の研究ではこちらを重視する見方もある。",
+        ],
+      },
+      {
+        id: "tsukiyama",
+        label: "築山殿との対立が発端だった説",
+        text: [
+          "生母・築山殿との関係悪化や、",
+          "家中の派閥対立が背景にあったとする説。",
+          "信康個人の資質とは別の、複雑な事情が見える。",
+        ],
+      },
     ],
   },
   4: {
     title: "第4章 - 清瀧寺・信康廟所",
-    body: [
+    intro: [
       "廟所の前で、選んだ結論を胸に手を合わせる。",
       "歴史の解釈は一つではない。",
       "それでも、この場所にあった悲劇は確かに存在した。",
-      "",
-      "> てをあわせる：エンディングへ",
+    ],
+    examine: [],
+    talk: () => [
+      "信太: ここが、信康公が眠る場所です。",
+      "信太: どの説を信じるにせよ……",
+      "信太: 実際にここに立ってみると、",
+      "信太: 重みが違いますね。",
     ],
   },
 };
 
-function drawAdvScreen() {
+const ENDING_TEXTS = {
+  nobunaga: [
+    "――織田信長の命による処断、という結論のもと、",
+    "静かに手を合わせた。",
+    "真相は今も定かではない。",
+    "だが、時空バグ探偵として、",
+    "一つの解釈にたどり着いたことは確かだ。",
+    "",
+    "(信長犯人説エンディング)",
+  ],
+  ieyasu: [
+    "――家康自身の決断だった、という結論のもと、",
+    "静かに手を合わせた。",
+    "戦国の当主として、家中を守るための苦渋の選択。",
+    "そう考えると、この場所の空気が違って見える。",
+    "",
+    "(家康主導説エンディング)",
+  ],
+  tsukiyama: [
+    "――築山殿をめぐる対立が発端、という結論のもと、",
+    "静かに手を合わせた。",
+    "権力だけでなく、家族の物語がここにあった。",
+    "",
+    "(築山殿対立説エンディング)",
+  ],
+};
+
+/* ---- ADV画面の描画本体(ディスパッチャ) ---- */
+function renderAdv() {
+  activeHitboxes = [];
   ctx.fillStyle = "#000010";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const data = CHAPTER_TEXT[GameState.chapter];
+  switch (advView.screen) {
+    case "examine_list": return renderExamineList();
+    case "quiz": return renderQuiz();
+    case "message": return renderMessage();
+    case "inventory": return renderInventory();
+    case "talk": return renderTalk();
+    case "deduction": return renderDeduction();
+    case "ending": return renderEnding();
+    default: return renderMain();
+  }
+}
+
+function currentChapterData() {
+  return CHAPTERS[GameState.chapter];
+}
+
+function renderMain() {
+  const ch = currentChapterData();
   ctx.fillStyle = "#fff";
   ctx.font = "16px monospace";
-  ctx.fillText(data.title, 20, 40);
-
+  ctx.fillText(ch.title, 20, 40);
   ctx.strokeStyle = "#fff";
-  ctx.strokeRect(15, 60, canvas.width - 30, 260);
-
-  ctx.font = "14px monospace";
-  data.body.forEach((line, i) => ctx.fillText(line, 25, 90 + i * 22));
+  ctx.strokeRect(15, 60, canvas.width - 30, 150);
+  ctx.font = "13px monospace";
+  ch.intro.forEach((line, i) => ctx.fillText(line, 25, 85 + i * 22));
 
   ctx.fillStyle = "#888";
-  ctx.font = "12px monospace";
-  ctx.fillText("(画面をタップで地図画面へ戻る - プロトタイプ簡易操作)", 20, 400);
+  ctx.font = "11px monospace";
+  ctx.fillText(`所持品: ${GameState.inventory.length}`, 20, 232);
+
+  let y = 250;
+  const btnH = 40;
+  if (ch.examine && ch.examine.length > 0) {
+    drawButton(20, y, canvas.width - 40, btnH, "▶ しらべる", () => {
+      advView = { screen: "examine_list" };
+      renderAdv();
+    });
+    y += btnH + 8;
+  }
+  if (ch.deductionChoices) {
+    const ready = ch.deductionRequires.every((id) => hasItem(id));
+    drawButton(
+      20, y, canvas.width - 40, btnH,
+      ready ? "▶ すいりする" : "▶ すいりする(？)",
+      () => {
+        advView = { screen: "deduction" };
+        renderAdv();
+      },
+      { disabled: false }
+    );
+    y += btnH + 8;
+  }
+  if (GameState.chapter === 4) {
+    drawButton(20, y, canvas.width - 40, btnH, "▶ てをあわせる", () => {
+      GameState.flags.paidRespects = true;
+      updateChapterClearStatus();
+      advView = { screen: "ending" };
+      renderAdv();
+    });
+    y += btnH + 8;
+  }
+  drawButton(20, y, canvas.width - 40, btnH, "はなす", () => {
+    advView = { screen: "talk" };
+    renderAdv();
+  });
+  y += btnH + 8;
+  drawButton(20, y, canvas.width - 40, btnH, "どうぐ", () => {
+    advView = { screen: "inventory" };
+    renderAdv();
+  });
+  y += btnH + 8;
+  drawButton(20, y, canvas.width - 40, btnH, "もどる(地図へ)", () => {
+    enterMapMode();
+  });
+}
+
+function renderExamineList() {
+  const ch = currentChapterData();
+  ctx.fillStyle = "#fff";
+  ctx.font = "15px monospace";
+  ctx.fillText("なにを しらべる？", 20, 40);
+  let y = 70;
+  const btnH = 40;
+  ch.examine.forEach((opt) => {
+    drawButton(20, y, canvas.width - 40, btnH, opt.label, () => selectExamine(opt));
+    y += btnH + 8;
+  });
+  drawButton(20, y, canvas.width - 40, btnH, "もどる", () => {
+    advView = { screen: "main" };
+    renderAdv();
+  });
+}
+
+function selectExamine(opt) {
+  if (opt.type === "quiz") {
+    if (opt.requires && !opt.requires.every((f) => GameState.flags[f])) {
+      advView = { screen: "message", lines: opt.lockedText, back: "examine_list" };
+      return renderAdv();
+    }
+    advView = { screen: "quiz", ref: opt };
+    return renderAdv();
+  }
+  if (opt.type === "flavor_item") {
+    if (hasItem(opt.itemId)) {
+      advView = { screen: "message", lines: opt.repeatText, back: "examine_list" };
+    } else {
+      addItem(opt.itemId, opt.itemLabel);
+      updateChapterClearStatus();
+      advView = { screen: "message", lines: opt.text, back: "examine_list" };
+    }
+    return renderAdv();
+  }
+  if (opt.type === "flavor_flag") {
+    GameState.flags[opt.flagId] = true;
+    advView = { screen: "message", lines: opt.text, back: "examine_list" };
+    return renderAdv();
+  }
+  // flavor
+  advView = { screen: "message", lines: opt.text, back: "examine_list" };
+  renderAdv();
+}
+
+function renderQuiz() {
+  const opt = advView.ref;
+  ctx.fillStyle = "#fff";
+  ctx.font = "13px monospace";
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(15, 30, canvas.width - 30, 70);
+  ctx.fillText(opt.prompt, 25, 55, canvas.width - 50);
+  let y = 120;
+  const btnH = 40;
+  opt.choices.forEach((label, idx) => {
+    drawButton(20, y, canvas.width - 40, btnH, label, () => answerQuiz(opt, idx));
+    y += btnH + 8;
+  });
+  drawButton(20, y, canvas.width - 40, btnH, "もどる", () => {
+    advView = { screen: "examine_list" };
+    renderAdv();
+  });
+}
+
+function answerQuiz(opt, idx) {
+  const correct = idx === opt.correct;
+  if (correct) {
+    addItem(opt.itemId, opt.itemLabel);
+    updateChapterClearStatus();
+  }
+  advView = {
+    screen: "message",
+    lines: correct ? opt.successText : opt.failText,
+    back: "quiz",
+    quizRef: opt,
+    quizBackOverride: correct ? "examine_list" : null,
+  };
+  renderAdv();
+}
+
+function renderMessage() {
+  ctx.fillStyle = "#fff";
+  ctx.font = "14px monospace";
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(15, 30, canvas.width - 30, 200);
+  (advView.lines || []).forEach((line, i) => ctx.fillText(line, 25, 60 + i * 24));
+
+  drawButton(20, 250, canvas.width - 40, 40, "つづける", () => {
+    if (advView.back === "quiz") {
+      advView = advView.quizBackOverride === "examine_list"
+        ? { screen: "examine_list" }
+        : { screen: "quiz", ref: advView.quizRef };
+    } else {
+      advView = { screen: advView.back || "main" };
+    }
+    renderAdv();
+  });
+}
+
+function renderInventory() {
+  ctx.fillStyle = "#fff";
+  ctx.font = "15px monospace";
+  ctx.fillText("どうぐ", 20, 40);
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(15, 60, canvas.width - 30, 180);
+  if (GameState.inventory.length === 0) {
+    ctx.font = "13px monospace";
+    ctx.fillStyle = "#888";
+    ctx.fillText("(なにも持っていない)", 25, 90);
+  } else {
+    ctx.font = "13px monospace";
+    GameState.inventory.forEach((id, i) => {
+      ctx.fillStyle = "#fff";
+      ctx.fillText(`・${ITEM_LABELS[id] || id}`, 25, 90 + i * 22);
+    });
+  }
+  drawButton(20, 260, canvas.width - 40, 40, "もどる", () => {
+    advView = { screen: "main" };
+    renderAdv();
+  });
+}
+
+function renderTalk() {
+  const ch = currentChapterData();
+  const lines = ch.talk ? ch.talk() : ["信太: ……特に話すことはなさそうです。"];
+  ctx.fillStyle = "#fff";
+  ctx.font = "13px monospace";
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(15, 30, canvas.width - 30, 160);
+  lines.forEach((line, i) => ctx.fillText(line, 25, 55 + i * 22));
+  drawButton(20, 210, canvas.width - 40, 40, "もどる", () => {
+    advView = { screen: "main" };
+    renderAdv();
+  });
+}
+
+function renderDeduction() {
+  const ch = currentChapterData();
+  const ready = ch.deductionRequires.every((id) => hasItem(id));
+  if (!ready) {
+    ctx.fillStyle = "#fff";
+    ctx.font = "13px monospace";
+    ctx.strokeStyle = "#fff";
+    ctx.strokeRect(15, 30, canvas.width - 30, 120);
+    ch.deductionLockedText.forEach((line, i) => ctx.fillText(line, 25, 55 + i * 22));
+    drawButton(20, 170, canvas.width - 40, 40, "もどる", () => {
+      advView = { screen: "main" };
+      renderAdv();
+    });
+    return;
+  }
+  ctx.fillStyle = "#fff";
+  ctx.font = "14px monospace";
+  ctx.fillText("どの説を採るか？", 20, 40);
+  let y = 65;
+  const btnH = 40;
+  ch.deductionChoices.forEach((c) => {
+    drawButton(20, y, canvas.width - 40, btnH, c.label, () => {
+      GameState.endingChoice = c.id;
+      updateChapterClearStatus();
+      advView = { screen: "message", lines: c.text, back: "main" };
+      renderAdv();
+    });
+    y += btnH + 8;
+  });
+  drawButton(20, y, canvas.width - 40, btnH, "もどる", () => {
+    advView = { screen: "main" };
+    renderAdv();
+  });
+}
+
+function renderEnding() {
+  const lines = ENDING_TEXTS[GameState.endingChoice] || ["……"];
+  ctx.fillStyle = "#fff";
+  ctx.font = "14px monospace";
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(15, 30, canvas.width - 30, 220);
+  lines.forEach((line, i) => ctx.fillText(line, 25, 60 + i * 24));
+  drawButton(20, 270, canvas.width - 40, 40, "もどる(地図へ)", () => {
+    enterMapMode();
+  });
 }
 
 /* =========================================================
@@ -603,7 +1079,8 @@ function enterAdvScene(zone) {
   document.getElementById("map").classList.add("hidden");
   document.getElementById("hud").classList.add("hidden");
   canvas.style.display = "block";
-  drawAdvScreen();
+  advView = { screen: "main" };
+  renderAdv();
 }
 
 function enterMapMode() {
@@ -618,8 +1095,15 @@ function enterMapMode() {
   if (map) map.resize();
 }
 
-canvas.addEventListener("click", () => {
-  if (GameState.mode === "adv") enterMapMode();
+canvas.addEventListener("click", (evt) => {
+  if (GameState.mode !== "adv") return;
+  const pos = getCanvasPos(evt);
+  for (const hb of activeHitboxes) {
+    if (pos.x >= hb.x && pos.x <= hb.x + hb.w && pos.y >= hb.y && pos.y <= hb.y + hb.h) {
+      hb.onClick();
+      return;
+    }
+  }
 });
 
 /* =========================================================
