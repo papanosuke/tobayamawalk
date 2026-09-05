@@ -88,7 +88,8 @@
   <div>
     <p>二俣城 時空バグ探偵<br>GPS ADV プロトタイプ（3D地図版）</p>
     <p style="font-size:12px; color:#aaa;">
-      位置情報の利用を許可してください。<br>
+      位置情報とカメラの利用を許可してください。<br>
+      （カメラはエンカウント演出の一瞬だけ使用します）<br>
       HTTPS環境（またはlocalhost）で開く必要があります。<br>
       地図タイルの読み込みにはネット接続が必要です。
     </p>
@@ -103,6 +104,7 @@
 <div id="map"></div>
 <div id="hud" class="hidden"></div>
 <canvas id="game" width="480" height="720"></canvas>
+<video id="cameraFeed" autoplay muted playsinline style="display:none;"></video>
 
 <script>
 "use strict";
@@ -365,6 +367,35 @@ function updatePlayerOnMap(current) {
 }
 
 /* =========================================================
+   5.5 カメラ（エンカウント演出で実写を使うため。歩行中の地図には使わない）
+   ポケモンGOも「歩き回る地図」はカメラ不使用の3Dマップ、
+   カメラを使うのは捕獲演出の一瞬だけ、という役割分担にならい、
+   ここでも同じ考え方にする（本格的なAR空間認識は行わない）。
+   ========================================================= */
+let cameraStream = null;
+let cameraReady = false;
+const cameraVideo = document.getElementById("cameraFeed");
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    logDebug("カメラAPI(getUserMedia)非対応の端末/環境です。エンカウント演出は地図のスナップショットで代用します。");
+    return;
+  }
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" }, // 背面カメラを優先
+      audio: false,
+    });
+    cameraVideo.srcObject = cameraStream;
+    await cameraVideo.play();
+    cameraReady = true;
+    logDebug("カメラ映像の取得に成功。エンカウント演出で使用します。");
+  } catch (ex) {
+    logDebug(`カメラ取得エラー: ${ex.message}（許可が下りなかった場合は地図のスナップショットで代用します）`);
+  }
+}
+
+/* =========================================================
    6. HUD表示
    ========================================================= */
 function updateHud(target, check) {
@@ -492,16 +523,29 @@ function triggerEncounter(zone) {
   document.getElementById("hud").classList.add("hidden");
   canvas.style.display = "block";
 
-  // 直前の地図の見た目をキャンバスへ焼き付ける(フィールド画面のスナップショット)
+  // フィールド画面のスナップショットを撮る。
+  // 優先順位: ①実写カメラ映像 → ②地図のスナップショット → ③黒画面
   let snapshot = null;
-  try {
-    ctx.drawImage(map.getCanvas(), 0, 0, canvas.width, canvas.height);
-    snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  } catch (ex) {
-    logDebug(`スナップショット取得エラー: ${ex.message}`);
-    ctx.fillStyle = "#001a00";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  if (cameraReady && cameraVideo.videoWidth > 0) {
+    try {
+      ctx.drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
+      snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      logDebug("カメラ映像をスナップショットに使用");
+    } catch (ex) {
+      logDebug(`カメラ映像の描画エラー: ${ex.message}`);
+    }
+  }
+  if (!snapshot) {
+    try {
+      ctx.drawImage(map.getCanvas(), 0, 0, canvas.width, canvas.height);
+      snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      logDebug("地図のスナップショットを使用(カメラ未取得のため)");
+    } catch (ex) {
+      logDebug(`スナップショット取得エラー: ${ex.message}`);
+      ctx.fillStyle = "#001a00";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    }
   }
 
   playEncounterSound();
@@ -683,6 +727,7 @@ document.getElementById("startBtn").addEventListener("click", () => {
   updateTargetMarker(GameState.currentZone);
 
   GeoTracker.start(onGeoUpdate);
+  startCamera(); // エンカウント演出用。失敗しても地図のスナップショットで代用されるので致命的ではない
 });
 
 document.getElementById("calibBtn").addEventListener("click", startCalibrationMode);
